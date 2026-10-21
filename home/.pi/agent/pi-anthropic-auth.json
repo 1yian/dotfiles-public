@@ -1,0 +1,6 @@
+{
+  "providers": [
+    "anthropic-2",
+    "anthropic-3"
+  ]
+}

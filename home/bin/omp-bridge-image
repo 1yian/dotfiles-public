@@ -1,0 +1,148 @@
+#!/usr/bin/env bash
+# Bridge a local (viewer) image to a remote agent on maverick.
+# Prints: @/tmp/omp-inbox/<file>   suitable to paste into an agent.
+#
+# Usage:
+#   omp-bridge-image                 # clipboard image, else newest Desktop screenshot
+#   omp-bridge-image /path/to.png    # explicit file (drag-drop path rewrite)
+#   omp-bridge-image --watch         # watch Desktop + TemporaryItems, auto-bridge
+set -euo pipefail
+
+REMOTE_HOST="${OMP_BRIDGE_HOST:-yian@maverick.local}"
+KNOWN_HOSTS="${OMP_BRIDGE_KNOWN_HOSTS:-$HOME/.config/wezterm/maverick-known-hosts}"
+REMOTE_DIR="${OMP_BRIDGE_REMOTE_DIR:-/tmp/omp-inbox}"
+SSH=(ssh -o BatchMode=yes -o ConnectTimeout=8)
+SCP=(scp -o BatchMode=yes -o ConnectTimeout=8)
+if [[ -f "$KNOWN_HOSTS" ]]; then
+  SSH+=(-o "UserKnownHostsFile=$KNOWN_HOSTS" -o "StrictHostKeyChecking=yes")
+  SCP+=(-o "UserKnownHostsFile=$KNOWN_HOSTS" -o "StrictHostKeyChecking=yes")
+fi
+
+log() { printf '%s\n' "$*" >&2; }
+
+is_image() {
+  local f="$1"
+  [[ -f "$f" ]] || return 1
+  case "${f##*.}" in
+    png|jpg|jpeg|gif|webp|PNG|JPG|JPEG|GIF|WEBP) return 0 ;;
+  esac
+  file -b --mime-type "$f" 2>/dev/null | grep -q '^image/'
+}
+
+clipboard_to_png() {
+  local out="$1"
+  # PNGf first, then TIFF via sips.
+  if osascript \
+    -e 'try' \
+    -e 'set png_data to the clipboard as «class PNGf»' \
+    -e "set fp to open for access POSIX file \"$out\" with write permission" \
+    -e 'set eof fp to 0' \
+    -e 'write png_data to fp' \
+    -e 'close access fp' \
+    -e 'return true' \
+    -e 'on error' \
+    -e 'return false' \
+    -e 'end try' 2>/dev/null | grep -q true; then
+    [[ -s "$out" ]] && return 0
+  fi
+  local tiff
+  tiff="$(mktemp -t ompbridge).tiff"
+  if osascript \
+    -e 'try' \
+    -e 'set tiff_data to the clipboard as «class TIFF»' \
+    -e "set fp to open for access POSIX file \"$tiff\" with write permission" \
+    -e 'set eof fp to 0' \
+    -e 'write tiff_data to fp' \
+    -e 'close access fp' \
+    -e 'return true' \
+    -e 'on error' \
+    -e 'return false' \
+    -e 'end try' 2>/dev/null | grep -q true \
+    && [[ -s "$tiff" ]]; then
+    sips -s format png "$tiff" --out "$out" >/dev/null 2>&1 || true
+    rm -f "$tiff"
+    [[ -s "$out" ]] && return 0
+  fi
+  rm -f "$tiff" 2>/dev/null || true
+  return 1
+}
+
+newest_desktop_shot() {
+  ls -t "$HOME/Desktop"/Screenshot*.png "$HOME/Desktop"/Screenshot*.jpg 2>/dev/null | head -1 || true
+}
+
+bridge_file() {
+  local src="$1"
+  is_image "$src" || { log "not an image: $src"; return 1; }
+  local base stamp remote local_copy
+  stamp="$(date +%Y%m%d-%H%M%S)"
+  base="$(basename "$src" | tr ' ' '_' | tr -cd 'A-Za-z0-9._-')"
+  [[ -n "$base" ]] || base="shot.png"
+  remote="$REMOTE_DIR/${stamp}-${base}"
+  "${SSH[@]}" "$REMOTE_HOST" "mkdir -p '$REMOTE_DIR'"
+  "${SCP[@]}" "$src" "$REMOTE_HOST:$remote"
+  printf '@%s\n' "$remote"
+}
+
+bridge_clipboard_or_desktop() {
+  local tmp
+  tmp="$(mktemp -t ompbridge).png"
+  if clipboard_to_png "$tmp"; then
+    bridge_file "$tmp"
+    rm -f "$tmp"
+    return 0
+  fi
+  rm -f "$tmp"
+  local shot
+  shot="$(newest_desktop_shot)"
+  if [[ -n "$shot" ]]; then
+    # Prefer a shot from the last 2 minutes if available.
+    local now mtime age
+    now="$(date +%s)"
+    mtime="$(stat -f %m "$shot" 2>/dev/null || echo 0)"
+    age=$((now - mtime))
+    if (( age <= 120 )); then
+      bridge_file "$shot"
+      return 0
+    fi
+    log "newest Desktop shot is ${age}s old; pass a path or copy image first"
+  fi
+  log "no clipboard image and no recent Desktop screenshot"
+  return 1
+}
+
+watch_loop() {
+  log "watching Desktop + TemporaryItems → $REMOTE_HOST:$REMOTE_DIR"
+  local last=""
+  while true; do
+    local cand=""
+    # macOS screenshot drag staging + Desktop
+    cand="$(ls -t \
+      "$HOME/Desktop"/Screenshot*.png \
+      /var/folders/*/*/*/TemporaryItems/NSIRD_screencapture*/*.png \
+      /var/folders/*/*/*/TemporaryItems/NSIRD_screencapture*/*.jpg \
+      2>/dev/null | head -1 || true)"
+    if [[ -n "$cand" && "$cand" != "$last" && -f "$cand" ]]; then
+      local now mtime
+      now="$(date +%s)"
+      mtime="$(stat -f %m "$cand" 2>/dev/null || echo 0)"
+      if (( now - mtime <= 15 )); then
+        last="$cand"
+        if out="$(bridge_file "$cand")"; then
+          # Copy attachment token for instant paste into the active agent.
+          printf '%s' "$out" | pbcopy
+          log "bridged → $out (copied to clipboard)"
+          # Best-effort: notify
+          osascript -e "display notification \"$out\" with title \"Image bridged\"" 2>/dev/null || true
+        fi
+      fi
+    fi
+    sleep 0.6
+  done
+}
+
+case "${1:-}" in
+  --watch|-w) watch_loop ;;
+  "") bridge_clipboard_or_desktop ;;
+  *) bridge_file "$1" ;;
+esac

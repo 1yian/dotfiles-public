@@ -1,0 +1,8 @@
+abi <abi/4.0>,
+include <tunables/global>
+
+# Same userns permission Ubuntu gives /opt/google/chrome/chrome, restricted to
+# the immutable Nix Chrome binary. No sysctl or blanket AppArmor disablement.
+profile p620-google-chrome /nix/store/*-google-chrome-*/share/google/chrome/chrome flags=(unconfined) {
+  userns,
+}

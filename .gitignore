@@ -1,0 +1,42 @@
+# Nix
+result
+result-*
+.direnv/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Editor
+*.swp
+*~
+.vscode/
+.idea/
+
+# Secrets / local overrides - never commit
+**/.env
+**/.env.*
+!**/.env.example
+**/*.pem
+**/*.key
+**/credentials.json
+**/adc.json
+**/auth.json
+**/models.json
+**/models-store.json
+**/mcp-auth.json
+
+# Home Manager / migration leftovers
+*.backup
+.dotfiles-migration-*/
+
+# Python junk from skills
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+**/config.yml.lock
+
+# Pi extension dependencies (npm install inside the extension dir)
+**/node_modules/
+node_modules/

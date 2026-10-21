@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+# Open a URL from Frontera (or any viewer host).
+# Plain http(s) links go straight to the local browser.
+# http://127.0.0.1:PORT/... and http://localhost:PORT/... are treated as
+# Maverick-local services: ensure an SSH local-forward, then open on this host.
+#
+# Usage:
+#   mav-open-url 'http://127.0.0.1:4387/session/abc'
+#   mav-open-url 'https://example.com'
+set -euo pipefail
+
+URI="${1-}"
+if [[ -z "$URI" ]]; then
+  echo "usage: mav-open-url <url>" >&2
+  exit 2
+fi
+
+log() { printf 'mav-open-url: %s\n' "$*" >&2; }
+
+REMOTE_HOST="${MAV_OPEN_HOST:-${OMP_BRIDGE_HOST:-yian@maverick.local}}"
+KNOWN_HOSTS="${MAV_OPEN_KNOWN_HOSTS:-${OMP_BRIDGE_KNOWN_HOSTS:-$HOME/.config/wezterm/maverick-known-hosts}}"
+CONTROL_DIR="${MAV_OPEN_CONTROL_DIR:-$HOME/.ssh/mav-open-control}"
+mkdir -p "$CONTROL_DIR"
+chmod 700 "$CONTROL_DIR" 2>/dev/null || true
+
+SSH_BASE=(ssh -o BatchMode=yes -o ConnectTimeout=8)
+if [[ -f "$KNOWN_HOSTS" ]]; then
+  SSH_BASE+=(-o "UserKnownHostsFile=$KNOWN_HOSTS" -o "StrictHostKeyChecking=yes")
+fi
+
+# Only rewrite loopback http(s). Everything else is a normal open.
+if [[ ! "$URI" =~ ^https?://(127\.0\.0\.1|localhost)(:[0-9]+)?(/.*)?$ ]]; then
+  log "direct open $URI"
+  exec open "$URI"
+fi
+
+# Parse host / port / path. Default http port 80 / https 443 if omitted.
+proto="${URI%%://*}"
+rest="${URI#*://}"
+hostport="${rest%%/*}"
+path="/"
+if [[ "$rest" == */* ]]; then
+  path="/${rest#*/}"
+fi
+if [[ "$hostport" == *:* ]]; then
+  port="${hostport##*:}"
+else
+  if [[ "$proto" == "https" ]]; then
+    port=443
+  else
+    port=80
+  fi
+fi
+
+case "$port" in
+  ''|*[!0-9]*)
+    log "bad port in $URI"
+    exit 1
+    ;;
+esac
+
+# Keep Maverick's forwarded service separate from any same-port service running
+# on Frontera. The stable offset also lets later clicks reuse the same tunnel.
+if (( port <= 55535 )); then
+  local_port=$((port + 10000))
+else
+  local_port=$((port - 10000))
+fi
+
+control="$CONTROL_DIR/port-${port}-${local_port}"
+ssh_mux=(
+  "${SSH_BASE[@]}"
+  -o "ControlMaster=auto"
+  -o "ControlPath=$control"
+  -o "ControlPersist=600"
+)
+
+listener_cmd() {
+  # Best-effort command name for whatever owns the local forwarding port.
+  lsof -nP -iTCP:"$local_port" -sTCP:LISTEN 2>/dev/null | awk 'NR==2{print $1; exit}'
+}
+
+port_is_listening() {
+  lsof -nP -iTCP:"$local_port" -sTCP:LISTEN >/dev/null 2>&1
+}
+
+# Prefer an existing mux tunnel; otherwise start one. Refuse an unexpected
+# listener on the forwarding port rather than opening the wrong local service.
+ensure_tunnel() {
+  if "${ssh_mux[@]}" -O check "$REMOTE_HOST" 2>/dev/null; then
+    log "reuse ssh mux for $REMOTE_HOST remote port $port on local port $local_port"
+    return 0
+  fi
+  if port_is_listening; then
+    local owner
+    owner="$(listener_cmd || true)"
+    log "local forwarding port $local_port is already owned by ${owner:-unknown}"
+    return 1
+  fi
+  log "starting ssh -L 127.0.0.1:${local_port}:127.0.0.1:${port} via $REMOTE_HOST"
+  if ! "${ssh_mux[@]}" -fN -L "127.0.0.1:${local_port}:127.0.0.1:${port}" "$REMOTE_HOST"; then
+    log "could not tunnel remote port ${port} via $REMOTE_HOST"
+    return 1
+  fi
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+    if port_is_listening; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  log "nothing listening on 127.0.0.1:${local_port} after tunnel"
+  return 1
+}
+
+ensure_tunnel || exit 1
+
+open_url="${proto}://127.0.0.1:${local_port}${path}"
+log "open $open_url"
+exec open "$open_url"
+

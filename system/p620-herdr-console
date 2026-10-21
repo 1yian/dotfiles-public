@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# Only tty1's local zprofile autostarts this, never SSH or a Herdr pane.
+set -euo pipefail
+export HOME=/Users/yian
+export PATH="$HOME/.local/bin:$HOME/.nix-profile/bin:/usr/local/bin:/usr/bin:/bin"
+export LANG=en_US.UTF-8
+cd "$HOME"
+
+run_client() {
+  while true; do
+    herdr --session default || true
+    sleep 2
+  done
+}
+
+# Keep foot/cage alive across detach and client deaths. This also avoids foot's
+# renderer shutdown race on many-core hosts. It is an explicit child invocation,
+# not an autostart hook on arbitrary PTYs.
+if [ "${1:-}" = --client ]; then
+  run_client
+  exit
+fi
+[ "$(tty)" = /dev/tty1 ] && [ -z "${SSH_CONNECTION:-}" ] && [ -z "${HERDR_PANE_ID:-}" ] || exit 1
+mode=$(</etc/p620-herdr/console-mode)
+case "$mode" in
+  text)
+    export TERM=linux
+    # The framebuffer is 2560x1440: 16x32 gives readable 160x45 cells.
+    setfont /usr/share/consolefonts/Lat15-Terminus32x16.psf.gz
+    setterm --blank 0 --powersave off --powerdown 0 || true
+    run_client
+    ;;
+  kiosk)
+    # One fullscreen Wayland surface, not a desktop. PAM/logind grants its seat.
+    XDG_RUNTIME_DIR="/run/user/$(id -u)"
+    export XDG_RUNTIME_DIR COLORTERM=truecolor WLR_RENDERER=pixman
+    while true; do
+      /usr/bin/cage -- /usr/bin/foot --config=/etc/p620-herdr/foot.ini \
+        /usr/local/bin/p620-herdr-console --client || true
+      sleep 2
+    done
+    ;;
+  *) printf 'Unknown P620 console mode: %s\n' "$mode" >&2; exit 1 ;;
+esac

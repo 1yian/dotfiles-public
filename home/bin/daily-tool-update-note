@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# Maverick 05:00 launchd entrypoint. It dispatches work through firstmate.
+# The inbox submission gets 60 seconds; the worker owns update verification.
+set -u
+
+if [ -z "${HOME:-}" ]; then
+  echo "HOME is required" >&2
+  exit 2
+fi
+
+LOG="$HOME/Library/Logs/daily-tool-update.log"
+mkdir -p "$HOME/Library/Logs"
+
+request_id="daily-tool-update-$(date +%F)"
+note_text='Daily 05:00 general system update: ACTION REQUIRED, not a reminder. Immediately dispatch a worker, without asking the captain for confirmation, to execute and verify the following on BOTH maverick and P620.
+
+Sync homefiles (the dotfiles repo) on each machine: fetch origin; if behind, fast-forward pull; if ahead, push; if diverged (including unpushed P620 commits), do not force, rebase, or merge-resolve automatically, and report it. Never discard uncommitted or unpushed work. After a pull, apply Home Manager only with a safe, non-disruptive switch; otherwise report why it was skipped. Inspect the activation plan first and do not apply prohibited changes.
+
+Reconcile Pi and its extensions, no-mistakes, and lavish-axi to the dotfiles pins, not arbitrary latest versions. Update firstmate and secondmates only through the guarded bin/fm-update.sh path. Update other installed global npm, pipx, and uv tools, preserving dotfiles-managed pins. On maverick run brew update and brew upgrade for eligible packages, preserving pins; do not run macOS system updates.
+
+On P620 run apt update, then inventory installed and candidate kernel and NVIDIA driver packages (including kernel meta-packages, images, headers, modules, NVIDIA libraries and firmware). Use apt-mark hold on those packages BEFORE apt upgrade, verify the holds, and leave them held. Never unhold or upgrade them. Simulate apt upgrade and inspect the full transaction first: if it would install, upgrade, remove, or replace any kernel, driver, GPU/Strata, BIOS, or firmware component, stop that transaction and report rather than bypassing holds. Run the safe apt upgrade without full-upgrade, dist-upgrade, removals, or release upgrades. Refresh eligible snaps after inspecting pending refreshes; exclude kernel, driver, GPU/Strata, BIOS, and firmware snaps and report exclusions. Do not run an unrestricted snap refresh if it could touch excluded components.
+
+Restart only verified idle sessions through guarded paths; leave active sessions running and report deferred restarts. Never reboot, perform BIOS/firmware or driver changes, touch GPU/Strata or credentials, or perform a major OS upgrade. These exclusions apply to every package manager and Home Manager, not only apt. Do not restart or update a shared no-mistakes daemon while other work is running; report a deferral instead.
+
+Verify each machine directly: dotfiles revision and sync state, Home Manager result, installed CLI and extension versions against pins, package-manager results, remaining updates, P620 apt holds, and unchanged kernel/NVIDIA versions. Send the captain one concise line per machine with versions, changes, holds, deferrals, and failures. Mark this note handled only after BOTH machines have been successfully updated and verified. An offline machine, failed command, or unverified/deferred required update is incomplete: report it, keep the note pending for retry, and never mark it done merely because a worker was dispatched.'
+
+{
+  printf '=== %s request_id=%s ===\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$request_id"
+  python3 - 60 /Users/yian/Projects/firstmate/bin/fm-inbox.sh note --request-id "$request_id" -- "$note_text" << 'PY'
+import os, signal, subprocess, sys
+seconds = int(sys.argv[1])
+cmd = sys.argv[2:]
+proc = subprocess.Popen(cmd, start_new_session=True)
+try:
+    rc = proc.wait(timeout=seconds)
+except subprocess.TimeoutExpired:
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except OSError:
+        pass
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        proc.wait()
+    sys.stderr.write("timeout after %ss\n" % seconds)
+    raise SystemExit(124)
+raise SystemExit(rc)
+PY
+  rc=$?
+  printf 'exit=%s\n' "$rc"
+} >>"$LOG" 2>&1
+exit "$rc"

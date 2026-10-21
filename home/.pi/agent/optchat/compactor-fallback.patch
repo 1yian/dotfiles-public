@@ -1,0 +1,167 @@
+--- a/src/compactor.ts
++++ b/src/compactor.ts
+@@ -8,6 +8,16 @@
+ import { DEFAULT_SETTINGS } from './settings.ts';
+ 
+ export interface ModelChoice { provider: string; model: string; thinking: ThinkingLevel }
++export const DEFAULT_COMPACTOR_FALLBACKS: readonly ModelChoice[] = [
++  { provider: 'openai-codex', model: 'gpt-6-luna', thinking: 'low' },
++  // Use Sonnet for the Vertex summary tier, even when the primary is Haiku.
++  { provider: 'vertex-claude', model: 'claude-sonnet-5-5', thinking: 'low' },
++];
++function rateLimited(error: unknown) {
++  const status = error && typeof error === 'object' ? (error as { status?: number; statusCode?: number }) : undefined;
++  return status?.status === 429 || status?.statusCode === 429 ||
++    /\b429\b|\brate[_ -]?limit(?:ed|_error)?\b|\boverloaded(?:_error)?\b|\btoo many requests\b/i.test(error instanceof Error ? error.message : String(error));
++}
+ /** A level the model can't take would be sent as no level, which Sonnet 5.5 runs at high effort; Pi's own sessions clamp the same way. */
+ export const reasoningFor = (model: Model<Api>, level: ThinkingLevel) => {
+   const thinking = clampThinkingLevel(model, level);
+@@ -53,35 +63,55 @@
+ }
+ /** The model is asked for 512 bytes; `accepted` is the longest line kept without a retry (the profile's summary size tolerance). */
+ export function createCompressor(registry: ModelRegistry, choice: () => ModelChoice,
+-  onUsage: (message: AssistantMessage) => void = () => {}, accepted = () => DEFAULT_SETTINGS.summaryAcceptBytes): Compressor {
++  onUsage: (message: AssistantMessage) => void = () => {}, accepted = () => DEFAULT_SETTINGS.summaryAcceptBytes,
++  fallbacks: () => readonly ModelChoice[] = () => DEFAULT_COMPACTOR_FALLBACKS): Compressor {
+   const gate = primeFirst();
+   return async (input, signal) => {
+-    const selected = choice();
+-    const model = registry.find(selected.provider, selected.model);
++    const choices = [choice(), ...fallbacks()].filter((item, index, all) =>
++      all.findIndex(other => other.provider === item.provider && other.model === item.model) === index);
++    let current = 0;
++    let selected = choices[current];
++    let model = registry.find(selected.provider, selected.model);
+     if (!model) throw new Error(`Compactor model unavailable: ${selected.provider}/${selected.model}. Use /optchat model.`);
+-    const thinking = reasoningFor(model, selected.thinking);
+     // Shown bare between the view and the input, the example was sometimes summarized as if it were chat, so it is labelled and both are tagged.
+     const step = `${input.historical ? IMPORT_GUIDANCE + '\n\n' : ''}For scale only, here is an example line, not from this chat; it is exactly 512 bytes and is never part of your input or your line:\n<example>${SCALE}</example>\n\n${provenance(input.kind)}${SCOPE}\n${input.merge ? 'Merge these two lines into one' : 'Compress this message into one line'}, in at most 512 bytes:\n<input>\n${input.source}\n</input>`;
+     const messages: Message[] = [{ role: 'user', content: [{ type: 'text', text: input.context }, { type: 'text', text: step }], timestamp: Date.now() }];
+     const view = splitView(input.context);
+-    const prefix = model.api === 'anthropic-messages' && view.length > 1 ? `${model.provider}/${model.id}/${thinking ?? 'off'}\n${view.slice(0, -1).join('')}` : undefined;
+     const tries: string[] = [];
+     for (let attempt = 0; attempt < 5; attempt++) {
+-      const warmed = prefix ? await gate(prefix, signal) : () => {};
+       let reply: AssistantMessage;
+-      try {
+-        const stream = registry.streamSimple(model, { systemPrompt: COMPACT, messages }, {
+-          // A shared session id is the OpenAI prompt-cache key; SSE because over a websocket Codex would chain unrelated parallel calls on one cached connection.
+-          sessionId: 'optchat-compactor', transport: 'sse',
+-          reasoning: thinking, signal, cacheRetention: 'short',
+-          onPayload: payload => model.api === 'anthropic-messages' ? cachePayload(payload) : payload,
+-        });
+-        // The cache entry is usable once the model starts answering.
+-        for await (const event of stream) if (event.type !== 'start') { warmed(event.type !== 'error'); break; }
+-        reply = await stream.result();
+-      } finally { warmed(false); }
+-      onUsage(reply);
+-      if (reply.stopReason === 'error' || reply.stopReason === 'aborted') throw new Error(reply.errorMessage ?? `Compactor ${reply.stopReason}`);
++      for (;;) {
++        signal.throwIfAborted();
++        const thinking = reasoningFor(model, selected.thinking);
++        const anthropic = model.api === 'anthropic-messages';
++        const prefix = anthropic && view.length > 1 ? `${model.provider}/${model.id}/${thinking ?? 'off'}\n${view.slice(0, -1).join('')}` : undefined;
++        const warmed = prefix ? await gate(prefix, signal) : () => {};
++        try {
++          try {
++            const stream = registry.streamSimple(model, { systemPrompt: COMPACT, messages }, {
++              // A shared session id is the OpenAI prompt-cache key; SSE because over a websocket Codex would chain unrelated parallel calls on one cached connection.
++              sessionId: 'optchat-compactor', transport: 'sse',
++              reasoning: thinking, signal, cacheRetention: 'short',
++              onPayload: payload => anthropic ? cachePayload(payload) : payload,
++            });
++            // The cache entry is usable once the model starts answering.
++            for await (const event of stream) if (event.type !== 'start') { warmed(event.type !== 'error'); break; }
++            reply = await stream.result();
++          } finally { warmed(false); }
++        } catch (error) {
++          signal.throwIfAborted();
++          if (!rateLimited(error) || !nextFallback()) throw error;
++          continue;
++        }
++        onUsage(reply);
++        if (reply.stopReason === 'error' || reply.stopReason === 'aborted') {
++          const error = new Error(reply.errorMessage ?? `Compactor ${reply.stopReason}`);
++          signal.throwIfAborted();
++          if (reply.stopReason === 'aborted' || !rateLimited(error) || !nextFallback()) throw error;
++          continue;
++        }
++        break;
++      }
+       const line = reply.content.filter(c => c.type === 'text').map(c => c.text).join('').trim();
+       if (!line) throw new Error('Compactor returned no text.');
+       tries.push(line);
+@@ -92,5 +122,17 @@
+       messages.push({ role: 'user', content: `That line is ${bytes(line)} bytes; the limit is 512. It must end where it is cut here:\n${cut}| ← LIMIT`, timestamp: Date.now() });
+     }
+     return tries.reduce((a, b) => bytes(a) <= bytes(b) ? a : b);
++
++    // Stay on a successful fallback for length-correction calls. A new compression
++    // starts at the profile's primary again; missing providers/auth are skipped.
++    function nextFallback() {
++      while (++current < choices.length) {
++        const candidate = registry.find(choices[current].provider, choices[current].model);
++        if (!candidate || !registry.hasConfiguredAuth(candidate)) continue;
++        selected = choices[current]; model = candidate;
++        return true;
++      }
++      return false;
++    }
+   };
+ }
+--- a/src/profiles.ts
++++ b/src/profiles.ts
+@@ -7,7 +7,7 @@
+ import { DEFAULT_SETTINGS, readSettings, type Settings } from './settings.ts';
+ 
+ export const dataHome = () => resolve(process.env.OPTCHAT_HOME ?? join(homedir(), '.optchat'));
+-export interface ProfileConfig extends Settings { compactor: ModelChoice; subagent: ModelChoice }
++export interface ProfileConfig extends Settings { compactor: ModelChoice; subagent: ModelChoice; compactorFallbacks?: ModelChoice[] }
+ export const defaults: ProfileConfig = {
+   compactor: { provider: 'anthropic', model: 'claude-sonnet-5-5', thinking: 'medium' },
+   subagent: { provider: 'anthropic', model: 'claude-opus-5-5', thinking: 'high' },
+@@ -46,8 +46,12 @@
+ }
+ export function loadConfig(dir: string): ProfileConfig {
+   const value: unknown = JSON.parse(readFileSync(join(dir, 'config.json'), 'utf8'));
+-  if (!record(value) || !modelChoice(value.compactor) || !modelChoice(value.subagent)) throw new Error(`Invalid profile config: ${dir}/config.json`);
+-  try { return { compactor: value.compactor, subagent: value.subagent, ...readSettings(value) }; }
++  if (!record(value) || !modelChoice(value.compactor) || !modelChoice(value.subagent) ||
++      (value.compactorFallbacks !== undefined && (!Array.isArray(value.compactorFallbacks) || !value.compactorFallbacks.every(modelChoice)))) {
++    throw new Error(`Invalid profile config: ${dir}/config.json`);
++  }
++  try { return { compactor: value.compactor, subagent: value.subagent,
++    ...(value.compactorFallbacks !== undefined ? { compactorFallbacks: value.compactorFallbacks as ModelChoice[] } : {}), ...readSettings(value) }; }
+   catch (error) { throw new Error(`Invalid profile config: ${dir}/config.json: ${error instanceof Error ? error.message : String(error)}`); }
+ }
+ export function instructions(dir: string) { return readFileSync(join(dir, 'AGENTS.md'), 'utf8'); }
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -8,7 +8,7 @@
+ import { parseSkillBlock, type ExtensionAPI, type ExtensionContext, type ExtensionCommandContext } from '@earendil-works/pi-coding-agent';
+ import { Type } from 'typebox';
+ import { Memory } from './memory.ts';
+-import { createCompressor } from './compactor.ts';
++import { createCompressor, DEFAULT_COMPACTOR_FALLBACKS } from './compactor.ts';
+ import { atomicWrite, createProfile, instructions, lastProfile, listProfiles, loadConfig, lockProfile, profilePath, rememberProfile, saveConfig, ProfileBusyError, type ProfileConfig } from './profiles.ts';
+ import { MASTER, VIEW_DOC } from './prompts.ts';
+ import { cachePayload, record } from './cache.ts';
+@@ -164,7 +164,7 @@
+       const memory = new Memory(memoryDirectory(dir), createCompressor(ctx.modelRegistry, () => config.compactor, message => {
+         usage.compression(message, 'compactor', sessionId);
+         status(ctx);
+-      }, () => config.summaryAcceptBytes), warning => ctx.ui.notify(warning, 'error'));
++      }, () => config.summaryAcceptBytes, () => config.compactorFallbacks ?? DEFAULT_COMPACTOR_FALLBACKS), warning => ctx.ui.notify(warning, 'error'));
+       openingMemory = memory;
+       const inbox = new Inbox(dir);
+       const recovered = pendingImport(dir) ? 0 : inbox.recover(memory);
+@@ -431,7 +431,7 @@
+         if (!closed) { await a.memory.close(); closed = true; }
+         const compress = createCompressor(ctx.modelRegistry, () => a.config.compactor, message => {
+           a.usage.compression(message, 'import', ctx.sessionManager.getSessionId());
+-        }, () => a.config.summaryAcceptBytes);
++        }, () => a.config.summaryAcceptBytes, () => a.config.compactorFallbacks ?? DEFAULT_COMPACTOR_FALLBACKS);
+         const completed = await showProgress(ctx, job, (signal, progress) => runImport(a.dir, compress, signal, progress), signal);
+         ctx.ui.notify(completed ? `Imported ${job.added} messages into ${a.name}. Previous memory retained at ${job.previous === '.' ? a.dir : join(a.dir, job.previous)}.`
+           : 'Import paused. Use /optchat import to resume. Other profiles remain available.', 'info');
